@@ -6,12 +6,11 @@ This script downloads SPHEREX images from the IRSA archive using astroquery,
 crops them to a common frame, reprojects to a common WCS, and assembles
 them into a data cube with wavelength information.
 
-TODO: Build the output cube before adding data in, then interpolate onto its grid.
-We should use spectral resolution of 100 and go from 2-5 microns (ignore short wavelengths),
-so the cube should have 0.1 micron steps from 2 to 5 microns (150-ish channels)
+It's largely AI-written, but the hard part was directly from help provided by
+IRSA/IPAC staff.
+AI provided the other 1200 lines of... something.
 
-
-Author: AI Assistant
+Author: Cursor AI Assistant
 Date: September 2025
 """
 
