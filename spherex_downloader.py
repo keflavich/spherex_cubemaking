@@ -24,6 +24,7 @@ from typing import List, Tuple, Optional, Dict, Any
 import argparse
 import urllib.request
 import urllib.error
+import time
 
 # Astronomy libraries
 from astropy.io import fits
@@ -43,13 +44,8 @@ from reproject import reproject_interp
 from reproject.mosaicking import find_optimal_celestial_wcs
 
 # Optional plotting
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
-    print("Warning: matplotlib not available. Plotting functions disabled.")
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -104,7 +100,10 @@ class SPHEREXDownloader:
     def search_spherex_images(self,
                              target: str = None,
                              coordinates: SkyCoord = None,
-                             radius: u.Quantity = 10*u.arcmin) -> Table:
+                             radius: u.Quantity = 10*u.arcmin,
+                             max_retries: int = 3,
+                             retry_delay: float = 5.0,
+                             use_local_only: bool = False) -> Table:
         """
         Search for SPHEREX images in IRSA archive.
 
@@ -116,6 +115,12 @@ class SPHEREXDownloader:
             Target coordinates
         radius : Quantity
             Search radius
+        max_retries : int
+            Maximum number of retry attempts for failed queries
+        retry_delay : float
+            Delay in seconds between retries
+        use_local_only : bool
+            If True, skip online queries and use only local files
 
         Returns
         -------
@@ -125,12 +130,11 @@ class SPHEREXDownloader:
         if self.verbose:
             print(f"Searching for SPHEREX images...")
 
-        # First, let's check what SPHEREX collections are available
-        collections = Irsa.list_collections(servicetype='SIA', filter='spherex')
-        if self.verbose:
-            print(f"Found {len(collections)} SPHEREX collections:")
-            for collection in collections['collection']:
-                print(f"  - {collection}")
+        # If using local files only, check for existing downloads
+        if use_local_only:
+            if self.verbose:
+                print("Using local files only (skipping online search)")
+            return self._get_local_images_table()
 
         # Determine coordinates
         if coordinates is None and target is not None:
@@ -142,49 +146,44 @@ class SPHEREXDownloader:
             print(f"Target coordinates: {coordinates.to_string('hmsdms')}")
             print(f"Search radius: {radius}")
 
-        # Search for images using Simple Image Access
-        try:
-            # Try searching for SPHEREX data specifically
-            images = Irsa.query_sia(pos=(coordinates, radius), collection='spherex')
+        # First, try to check what SPHEREX collections are available
+        if self.verbose:
+            print("Checking available SPHEREX collections...")
+        collections = Irsa.list_collections(servicetype='SIA', filter='spherex')
+        if self.verbose:
+            print(f"Found {len(collections)} SPHEREX collections:")
+            for collection in collections['collection']:
+                print(f"  - {collection}")
 
-            if len(images) == 0:
-                # Fallback: search all collections
-                if self.verbose:
-                    print("No SPHEREX-specific images found. Searching all collections...")
-                images = Irsa.query_sia(pos=(coordinates, radius))
-
-                # Filter for potential SPHEREX data
-                if len(images) > 0:
-                    spherex_mask = np.array([
-                        'spherex' in str(row.get('collection', '')).lower() or
-                        'spherex' in str(row.get('obs_collection', '')).lower() or
-                        'spherex' in str(row.get('dataid_collection', '')).lower()
-                        for row in images
-                    ])
-                    images = images[spherex_mask] if np.any(spherex_mask) else images[:0]
-
-        except Exception as e:
+        # Try searching for SPHEREX data with different collection names
+        images = Table()
+        for collection_name in ['spherex_qr2', 'spherex_qr2_deep', 'spherex']:
             if self.verbose:
-                print(f"SIA query failed: {e}")
-                print("Attempting catalog search as fallback...")
-
-            # Fallback to catalog search
-            try:
-                catalogs = Irsa.list_catalogs(filter='spherex')
-                if len(catalogs) > 0:
-                    catalog_name = list(catalogs.keys())[0]
-                    images = Irsa.query_region(
-                        coordinates=coordinates,
-                        spatial='Cone',
-                        catalog=catalog_name,
-                        radius=radius
-                    )
-                else:
-                    images = Table()
-            except Exception as e2:
+                print(f"Querying collection: {collection_name}")
+            images = Irsa.query_sia(pos=(coordinates, radius), collection=collection_name)
+            if len(images) > 0:
                 if self.verbose:
-                    print(f"Catalog search also failed: {e2}")
-                images = Table()
+                    print(f"Success! Found {len(images)} images in collection: {collection_name}")
+                break
+            else:
+                if self.verbose:
+                    print(f"  No images found in {collection_name}")
+
+        if len(images) == 0:
+            # Fallback: search all collections
+            if self.verbose:
+                print("No SPHEREX-specific images found. Searching all collections...")
+            images = Irsa.query_sia(pos=(coordinates, radius))
+
+            # Filter for potential SPHEREX data
+            if len(images) > 0:
+                spherex_mask = np.array([
+                    'spherex' in str(row.get('collection', '')).lower() or
+                    'spherex' in str(row.get('obs_collection', '')).lower() or
+                    'spherex' in str(row.get('dataid_collection', '')).lower()
+                    for row in images
+                ])
+                images = images[spherex_mask] if np.any(spherex_mask) else images[:0]
 
         if self.verbose:
             print(f"Found {len(images)} images")
@@ -192,6 +191,30 @@ class SPHEREXDownloader:
                 print("Available columns:", images.colnames[:10])  # Show first 10 columns
 
         return images
+
+    def _get_local_images_table(self) -> Table:
+        """
+        Create a table from existing local FITS files.
+
+        Returns
+        -------
+        Table
+            Table with information about local FITS files
+        """
+        local_fits = list(self.images_dir.glob('*.fits'))
+        
+        if len(local_fits) == 0:
+            return Table()
+
+        # Create a simple table with local file information
+        obs_ids = [f.stem for f in local_fits]
+        access_urls = [f"file://{f.absolute()}" for f in local_fits]
+        
+        return Table({
+            'obs_id': obs_ids,
+            'access_url': access_urls,
+            'local_file': [str(f) for f in local_fits]
+        })
 
     def download_images(self, images: Table, max_images: int = None) -> List[str]:
         """
@@ -225,65 +248,48 @@ class SPHEREXDownloader:
                 print("  (This may take a while for large datasets...)")
 
         for i, image in enumerate(images):
-            try:
-                # Determine the access URL
-                url = None
-                for url_col in ['access_url', 'cloud_access', 'download_url', 'url']:
-                    if url_col in image.colnames and image[url_col]:
-                        url = str(image[url_col])
-                        break
+            # Determine the access URL
+            url = None
+            for url_col in ['access_url', 'cloud_access', 'download_url', 'url']:
+                if url_col in image.colnames and image[url_col]:
+                    url = str(image[url_col])
+                    break
 
-                if url is None:
-                    if self.verbose:
-                        print(f"  Skipping image {i+1}: No access URL found")
-                    continue
-
-                # Generate filename
-                obs_id = image.get('obs_id', f'spherex_{i:04d}')
-                filename = f"{obs_id}.fits"
-                filepath = self.images_dir / filename
-
-                if filepath.exists():
-                    if self.verbose:
-                        print(f"  Image {i+1}/{len(images)}: {filename} already exists")
-                    downloaded_files.append(str(filepath))
-                    continue
-
-                # Download the file
+            if url is None:
                 if self.verbose:
-                    print(f"  Downloading image {i+1}/{len(images)}: {filename}")
-
-                # Download using urllib first, then open with astropy
-                try:
-                    # Download to temporary location first
-                    temp_filepath = filepath.with_suffix('.tmp')
-                    urllib.request.urlretrieve(url, temp_filepath)
-
-                    # Verify it's a valid FITS file by opening it
-                    with fits.open(temp_filepath) as hdul:
-                        # Save as final file
-                        hdul.writeto(filepath, overwrite=True)
-
-                    # Remove temporary file
-                    temp_filepath.unlink()
-
-                except urllib.error.URLError as e:
-                    if self.verbose:
-                        print(f"    URL error: {e}")
-                    continue
-                except Exception as fits_error:
-                    # Clean up temp file if it exists
-                    temp_filepath = filepath.with_suffix('.tmp')
-                    if temp_filepath.exists():
-                        temp_filepath.unlink()
-                    raise fits_error
-
-                downloaded_files.append(str(filepath))
-
-            except Exception as e:
-                if self.verbose:
-                    print(f"  Failed to download image {i+1}: {e}")
+                    print(f"  Skipping image {i+1}: No access URL found")
                 continue
+
+            # Generate filename
+            obs_id = image.get('obs_id', f'spherex_{i:04d}')
+            filename = f"{obs_id}.fits"
+            filepath = self.images_dir / filename
+
+            if filepath.exists():
+                if self.verbose:
+                    print(f"  Image {i+1}/{len(images)}: {filename} already exists")
+                downloaded_files.append(str(filepath))
+                continue
+
+            # Download the file
+            if self.verbose:
+                print(f"  Downloading image {i+1}/{len(images)}: {filename}")
+
+            # Download using urllib first, then open with astropy
+            # Download to temporary location first
+            temp_filepath = filepath.with_suffix('.tmp')
+            urllib.request.urlretrieve(url, temp_filepath)
+
+            # Verify it's a valid FITS file by opening it
+            with fits.open(temp_filepath) as hdul:
+                # Save as final file
+                hdul.writeto(filepath, overwrite=True)
+
+            # Remove temporary file
+            temp_filepath.unlink()
+
+            downloaded_files.append(str(filepath))
+
 
         if self.verbose:
             print(f"Successfully downloaded {len(downloaded_files)} images")
@@ -335,18 +341,10 @@ class SPHEREXDownloader:
             raise ValueError("No valid WCS found in any image")
 
         # Use reproject to find optimal common WCS
-        try:
-            common_wcs, shape = find_optimal_celestial_wcs(
-                [(np.ones(shape), wcs) for wcs, shape in zip(wcs_list, shapes)],
-                frame='icrs'
-            )
-        except Exception as e:
-            if self.verbose:
-                print(f"  Warning: find_optimal_celestial_wcs failed: {e}")
-                print("  Using first image WCS as reference")
-            raise
-            common_wcs = wcs_list[0]
-            shape = shapes[0]
+        common_wcs, shape = find_optimal_celestial_wcs(
+            [(np.ones(shape), wcs) for wcs, shape in zip(wcs_list, shapes)],
+            frame='icrs'
+        )
 
         # If target coordinates are provided, center the frame there
         if target_coords is not None:
@@ -401,83 +399,77 @@ class SPHEREXDownloader:
         reprojected_files = []
 
         for i, filepath in enumerate(image_files):
-            try:
-                filename = Path(filepath).stem
-                output_file = self.processed_dir / f"{filename}_reprojected.fits"
+            filename = Path(filepath).stem
+            output_file = self.processed_dir / f"{filename}_reprojected.fits"
 
-                if output_file.exists():
+            if output_file.exists():
+                if self.verbose:
+                    print(f"  Image {i+1}/{len(image_files)}: {output_file.name} already exists")
+                reprojected_files.append(str(output_file))
+                continue
+
+            if self.verbose:
+                print(f"  Reprojecting image {i+1}/{len(image_files)}: {Path(filepath).name}")
+
+            with fits.open(filepath) as hdul:
+                # Find the primary data extension
+                data_hdu = None
+                for hdu in hdul:
+                    if hdu.data is not None and hdu.data.size > 1:
+                        data_hdu = hdu
+                        break
+
+                if data_hdu is None:
                     if self.verbose:
-                        print(f"  Image {i+1}/{len(image_files)}: {output_file.name} already exists")
-                    reprojected_files.append(str(output_file))
+                        print(f"    Warning: No data found in {filepath}")
                     continue
 
-                if self.verbose:
-                    print(f"  Reprojecting image {i+1}/{len(image_files)}: {Path(filepath).name}")
+                wcs_in = WCS(data_hdu.header)
 
-                with fits.open(filepath) as hdul:
-                    # Find the primary data extension
-                    data_hdu = None
-                    for hdu in hdul:
-                        if hdu.data is not None and hdu.data.size > 1:
-                            data_hdu = hdu
-                            break
+                # Reproject the image
+                reprojected_data, footprint = reproject_interp(
+                    (data_hdu.data, wcs_in),
+                    common_wcs,
+                    output_shape
+                )
 
-                    if data_hdu is None:
-                        if self.verbose:
-                            print(f"    Warning: No data found in {filepath}")
-                        continue
+                #header = data_hdu.header.copy()
+                #header.update(common_wcs.to_header())
+                header = common_wcs.to_header()
 
-                    wcs_in = WCS(data_hdu.header)
+                # Create new HDU with reprojected data
+                new_hdu = fits.PrimaryHDU(data=reprojected_data, header=header)
 
-                    # Reproject the image
-                    reprojected_data, footprint = reproject_interp(
-                        (data_hdu.data, wcs_in),
-                        common_wcs,
-                        output_shape
-                    )
+                spectral_wcs = WCS(data_hdu.header, fobj=hdul, key="W")
+                spectral_wcs.sip = None
+                sh = reprojected_data.shape
+                xx, yy = common_wcs.world_to_pixel(wcs_in.pixel_to_world(*np.mgrid[:sh[0], :sh[1]]))
+                ww, bandwidth = spectral_wcs.pixel_to_world(xx, yy)
+                wave_header = fits.Header({'unit': spectral_wcs.wcs.cunit[0].to_string()})
+                bw_header = fits.Header({'unit': spectral_wcs.wcs.cunit[1].to_string()})
+                wave_header.update(header)
+                bw_header.update(header)
 
-                    #header = data_hdu.header.copy()
-                    #header.update(common_wcs.to_header())
-                    header = common_wcs.to_header()
-
-                    # Create new HDU with reprojected data
-                    new_hdu = fits.PrimaryHDU(data=reprojected_data, header=header)
-
-                    spectral_wcs = WCS(data_hdu.header, fobj=hdul, key="W")
-                    spectral_wcs.sip = None
-                    sh = reprojected_data.shape
-                    xx, yy = common_wcs.world_to_pixel(wcs_in.pixel_to_world(*np.mgrid[:sh[0], :sh[1]]))
-                    ww, bandwidth = spectral_wcs.pixel_to_world(xx, yy)
-                    wave_header = fits.Header({'unit': spectral_wcs.wcs.cunit[0].to_string()})
-                    bw_header = fits.Header({'unit': spectral_wcs.wcs.cunit[1].to_string()})
-                    wave_header.update(header)
-                    bw_header.update(header)
-
-                    new_hdul = fits.HDUList([new_hdu,
-                                             fits.ImageHDU(ww.value, header=wave_header, name='WAVELENGTH'),
-                                             fits.ImageHDU(bandwidth.value, header=bw_header, name='BANDWIDTH'),
-                                             ]
-                                             )
+                new_hdul = fits.HDUList([new_hdu,
+                                            fits.ImageHDU(ww.value, header=wave_header, name='WAVELENGTH'),
+                                            fits.ImageHDU(bandwidth.value, header=bw_header, name='BANDWIDTH'),
+                                            ]
+                                            )
 
 
-                    # Copy relevant metadata
-                    for key in ['OBJECT', 'FILTER', 'EXPTIME', 'DATE-OBS', 'TELESCOP', 'INSTRUME']:
-                        if key in data_hdu.header:
-                            new_hdu.header[key] = data_hdu.header[key]
+                # Copy relevant metadata
+                for key in ['OBJECT', 'FILTER', 'EXPTIME', 'DATE-OBS', 'TELESCOP', 'INSTRUME']:
+                    if key in data_hdu.header:
+                        new_hdu.header[key] = data_hdu.header[key]
 
-                    # Add processing information
-                    new_hdu.header['REPROJ'] = True
-                    new_hdu.header['COMMENT'] = 'Reprojected to common WCS frame'
+                # Add processing information
+                new_hdu.header['REPROJ'] = True
+                new_hdu.header['COMMENT'] = 'Reprojected to common WCS frame'
 
-                    # Save reprojected image
-                    new_hdul.writeto(output_file, overwrite=True)
-                    reprojected_files.append(str(output_file))
+                # Save reprojected image
+                new_hdul.writeto(output_file, overwrite=True)
+                reprojected_files.append(str(output_file))
 
-            except Exception as e:
-                if self.verbose:
-                    print(f"    Error reprojecting {filepath}: {e}")
-                raise
-                continue
 
         if self.verbose:
             print(f"Successfully reprojected {len(reprojected_files)} images")
@@ -550,18 +542,15 @@ class SPHEREXDownloader:
 
         # Method 1: Check if this is a 3D cube with wavelength information
         if header.get('NAXIS', 0) == 3 and header.get('NAXIS3', 0) > 1:
-            try:
-                # This might be a spectral cube - try to extract wavelength axis
-                wcs_3d = WCS(header)
-                if wcs_3d.wcs.ctype[2] in ['WAVE', 'FREQ', 'VELO']:
-                    # Get wavelength for each slice and see if we can map to spatial position
-                    if self.verbose:
-                        print(f"      Found 3D cube with spectral axis: {wcs_3d.wcs.ctype[2]}")
-                    # For now, use the center wavelength - could be improved
-                    center_wl = wavelength_map.get(filepath, 3.0)  # fallback to 3 microns
-                    return np.full((ny, nx), center_wl, dtype=np.float32)
-            except Exception:
-                pass
+            # This might be a spectral cube - try to extract wavelength axis
+            wcs_3d = WCS(header)
+            if wcs_3d.wcs.ctype[2] in ['WAVE', 'FREQ', 'VELO']:
+                # Get wavelength for each slice and see if we can map to spatial position
+                if self.verbose:
+                    print(f"      Found 3D cube with spectral axis: {wcs_3d.wcs.ctype[2]}")
+                # For now, use the center wavelength - could be improved
+                center_wl = wavelength_map.get(filepath, 3.0)  # fallback to 3 microns
+                return np.full((ny, nx), center_wl, dtype=np.float32)
 
         # Method 2: Look for wavelength gradient keywords in header
         gradient_keywords = [
@@ -578,8 +567,9 @@ class SPHEREXDownloader:
                             print(f"      Found wavelength gradient keyword {keyword}: {gradient_value}")
                         # Create simple linear gradient
                         return self._create_linear_gradient(shape, wavelength_map[filepath], gradient_value)
-                except (ValueError, TypeError):
-                    continue
+                except (TypeError, ValueError):
+                    # can't convert
+                    pass
 
         # Method 3: Model SPHEREX-like disperser gradient
         # SPHEREX has a linear variable filter that creates a wavelength gradient
@@ -773,144 +763,140 @@ class SPHEREXDownloader:
 
         # Process each input image
         for i, filepath in enumerate(image_files):
-            try:
-                with fits.open(filepath) as hdul:
-                    data = hdul[0].data
-                    header = hdul[0].header
-                    wavelength_map_2d = wavelength = hdul['WAVELENGTH'].data
-                    if data.shape != (ny, nx):
-                        raise ValueError(f"Image {Path(filepath).name} has different shape, skipping")
+            with fits.open(filepath) as hdul:
+                data = hdul[0].data
+                header = hdul[0].header
+                wavelength_map_2d = wavelength = hdul['WAVELENGTH'].data
+                if data.shape != (ny, nx):
+                    raise ValueError(f"Image {Path(filepath).name} has different shape, skipping")
 
-                # Vectorized processing of all pixels at once
-                # Create masks for valid data and wavelength range
-                valid_data_mask = np.isfinite(data)
-                valid_wavelength_mask = ((wavelength_map_2d >= self.output_wavelength_min) &
-                                       (wavelength_map_2d <= self.output_wavelength_max))
-                combined_mask = valid_data_mask & valid_wavelength_mask
+            # Vectorized processing of all pixels at once
+            # Create masks for valid data and wavelength range
+            valid_data_mask = np.isfinite(data)
+            valid_wavelength_mask = ((wavelength_map_2d >= self.output_wavelength_min) &
+                                    (wavelength_map_2d <= self.output_wavelength_max))
+            combined_mask = valid_data_mask & valid_wavelength_mask
 
-                if not np.any(combined_mask):
-                    raise ValueError(f"No valid pixels in wavelength range for {Path(filepath).name}")
-
-                # Get valid pixel data and wavelengths
-                valid_data = data[combined_mask]
-                valid_wavelengths = wavelength_map_2d[combined_mask]
-                valid_y_coords, valid_x_coords = np.where(combined_mask)
-
-                # Vectorized channel distance calculation for all valid pixels
-                # Shape: (n_pixels, n_channels)
-                pixel_channel_distances = np.abs(valid_wavelengths[:, np.newaxis] - self.output_wavelengths[np.newaxis, :])
-
-                # Find closest and second closest channels for each pixel
-                # Shape: (n_pixels, n_channels) -> (n_pixels, 2)
-                # TODO: refactor this so that all channels get _some_ weight, and it's inverse-distance weighted
-                # then the cube will be fully populated (incorrectly...) and we can mask out pixels with max weight less than some threshold later on
-                sorted_channel_indices = np.argsort(pixel_channel_distances, axis=1)[:, :2]
-                ch1_indices = sorted_channel_indices[:, 0]
-                ch2_indices = sorted_channel_indices[:, 1]
-
-                # Get distances to closest channels
-                pixel_indices = np.arange(len(valid_data))
-                dist1 = pixel_channel_distances[pixel_indices, ch1_indices]
-                dist2 = pixel_channel_distances[pixel_indices, ch2_indices]
-
-                # Determine which pixels contribute to 2 channels vs 1 channel
-                two_channel_mask = dist2 <= self.output_wavelength_step
-
-                # Calculate weights for two-channel contributions
-                weights1 = np.ones_like(dist1) * np.nan
-                weights2 = np.zeros_like(dist2) * np.nan
-
-                # For pixels contributing to 2 channels, calculate inverse distance weights
-                two_ch_pixels = np.where(two_channel_mask)[0]
-                if len(two_ch_pixels) > 0:
-                    d1_two = dist1[two_ch_pixels]
-                    d2_two = dist2[two_ch_pixels]
-
-                    # Handle zero distances
-                    zero_d1 = (d1_two == 0)
-                    zero_d2 = (d2_two == 0)
-
-                    # Default inverse distance weights
-                    w1_two = np.where(zero_d1, 1.0, 1.0 / np.maximum(d1_two, 1e-10))
-                    w2_two = np.where(zero_d2, 1.0, 1.0 / np.maximum(d2_two, 1e-10))
-
-                    # Handle special cases where one distance is zero
-                    w1_two = np.where(zero_d1, 1.0, w1_two)
-                    w2_two = np.where(zero_d1, 0.0, w2_two)
-                    w1_two = np.where(zero_d2, 0.0, w1_two)
-                    w2_two = np.where(zero_d2, 1.0, w2_two)
-
-                    # Normalize weights to sum to 1
-                    total_weights = w1_two + w2_two
-                    w1_two = w1_two / total_weights
-                    w2_two = w2_two / total_weights
-
-                    weights1[two_ch_pixels] = w1_two
-                    weights2[two_ch_pixels] = w2_two
-
-                if np.any(np.isnan(weights1)) or np.any(np.isnan(weights2)):
-                    raise ValueError(f"Weights are NaN for {Path(filepath).name}")
-
-                # Vectorized channel assignment using advanced indexing
-                # Filter for valid channels
-                valid_ch1_mask = (ch1_indices >= 0) & (ch1_indices < nz_output) & (weights1 > 0)
-                valid_ch2_mask = (ch2_indices >= 0) & (ch2_indices < nz_output) & (weights2 > 0) & two_channel_mask
-
-                # this is a corner case that can't happen .... but does?!?
-                # Get all unique channels that will receive contributions
-                all_contributing_channels = np.concatenate([
-                    ch1_indices[valid_ch1_mask],
-                    ch2_indices[valid_ch2_mask]
-                ])
-                contributing_channels_set = np.unique(all_contributing_channels)
-
-                # Initialize all required channels at once
-                for ch_idx in contributing_channels_set:
-                    if np.all(np.isnan(output_datacube[ch_idx])):
-                        # in theory this should never happen because nothing is setting these to nan...
-                        print(f"    Warning: Channel {ch_idx} is all NaN, setting to zeros")
-                        output_datacube[ch_idx] = np.zeros((ny, nx), dtype=np.float32)
-                        channel_weights[ch_idx] = np.zeros((ny, nx), dtype=np.float32)
-
-                # Vectorized assignment for first channel contributions
-                if np.any(valid_ch1_mask):
-                    valid_pixels_ch1 = np.where(valid_ch1_mask)[0]
-                    ch1_valid = ch1_indices[valid_pixels_ch1]
-                    weights1_valid = weights1[valid_pixels_ch1]
-                    data_valid_ch1 = valid_data[valid_pixels_ch1]
-                    y_coords_ch1 = valid_y_coords[valid_pixels_ch1]
-                    x_coords_ch1 = valid_x_coords[valid_pixels_ch1]
-
-                    # Use advanced indexing for batch assignment
-                    output_datacube[ch1_valid, y_coords_ch1, x_coords_ch1] += data_valid_ch1 * weights1_valid
-                    channel_weights[ch1_valid, y_coords_ch1, x_coords_ch1] += weights1_valid
-
-                # Vectorized assignment for second channel contributions
-                if np.any(valid_ch2_mask):
-                    valid_pixels_ch2 = np.where(valid_ch2_mask)[0]
-                    ch2_valid = ch2_indices[valid_pixels_ch2]
-                    weights2_valid = weights2[valid_pixels_ch2]
-                    data_valid_ch2 = valid_data[valid_pixels_ch2]
-                    y_coords_ch2 = valid_y_coords[valid_pixels_ch2]
-                    x_coords_ch2 = valid_x_coords[valid_pixels_ch2]
-
-                    # Use advanced indexing for batch assignment
-                    output_datacube[ch2_valid, y_coords_ch2, x_coords_ch2] += data_valid_ch2 * weights2_valid
-                    channel_weights[ch2_valid, y_coords_ch2, x_coords_ch2] += weights2_valid
-
-                if self.verbose:
-                    # Report wavelength range and channel contributions for this image
-                    wl_min = np.nanmin(wavelength_map_2d)
-                    wl_max = np.nanmax(wavelength_map_2d)
-                    channels_list = sorted(contributing_channels_set)
-                    channel_info = f"channels {channels_list[0]}-{channels_list[-1]}" if channels_list else "no channels"
-                    print(f"    Image {i+1}/{len(image_files)}: {Path(filepath).name} "
-                          f"(λ: {wl_min:.3f}-{wl_max:.3f} μm) -> {channel_info} ({len(channels_list)} total)")
-
-            except Exception as e:
-                if self.verbose:
-                    print(f"    Error processing {filepath}: {e}")
+            if not np.any(combined_mask):
                 continue
+                raise ValueError(f"No valid pixels in wavelength range for {Path(filepath).name}")
+
+            # Get valid pixel data and wavelengths
+            valid_data = data[combined_mask]
+            valid_wavelengths = wavelength_map_2d[combined_mask]
+            valid_y_coords, valid_x_coords = np.where(combined_mask)
+
+            # Vectorized channel distance calculation for all valid pixels
+            # Shape: (n_pixels, n_channels)
+            pixel_channel_distances = np.abs(valid_wavelengths[:, np.newaxis] - self.output_wavelengths[np.newaxis, :])
+
+            # Find closest and second closest channels for each pixel
+            # Shape: (n_pixels, n_channels) -> (n_pixels, 2)
+            # TODO: refactor this so that all channels get _some_ weight, and it's inverse-distance weighted
+            # then the cube will be fully populated (incorrectly...) and we can mask out pixels with max weight less than some threshold later on
+            sorted_channel_indices = np.argsort(pixel_channel_distances, axis=1)[:, :2]
+            ch1_indices = sorted_channel_indices[:, 0]
+            ch2_indices = sorted_channel_indices[:, 1]
+
+            # Get distances to closest channels
+            pixel_indices = np.arange(len(valid_data))
+            dist1 = pixel_channel_distances[pixel_indices, ch1_indices]
+            dist2 = pixel_channel_distances[pixel_indices, ch2_indices]
+
+            # Determine which pixels contribute to 2 channels vs 1 channel
+            two_channel_mask = dist2 <= self.output_wavelength_step
+
+            # Calculate weights for two-channel contributions
+            weights1 = np.ones_like(dist1) * np.nan
+            weights2 = np.zeros_like(dist2) * np.nan
+
+            # For pixels contributing to 2 channels, calculate inverse distance weights
+            two_ch_pixels = np.where(two_channel_mask)[0]
+            if len(two_ch_pixels) > 0:
+                d1_two = dist1[two_ch_pixels]
+                d2_two = dist2[two_ch_pixels]
+
+                # Handle zero distances
+                zero_d1 = (d1_two == 0)
+                zero_d2 = (d2_two == 0)
+
+                # Default inverse distance weights
+                w1_two = np.where(zero_d1, 1.0, 1.0 / np.maximum(d1_two, 1e-10))
+                w2_two = np.where(zero_d2, 1.0, 1.0 / np.maximum(d2_two, 1e-10))
+
+                # Handle special cases where one distance is zero
+                w1_two = np.where(zero_d1, 1.0, w1_two)
+                w2_two = np.where(zero_d1, 0.0, w2_two)
+                w1_two = np.where(zero_d2, 0.0, w1_two)
+                w2_two = np.where(zero_d2, 1.0, w2_two)
+
+                # Normalize weights to sum to 1
+                total_weights = w1_two + w2_two
+                w1_two = w1_two / total_weights
+                w2_two = w2_two / total_weights
+
+                weights1[two_ch_pixels] = w1_two
+                weights2[two_ch_pixels] = w2_two
+
+            if np.any(np.isnan(weights1)) or np.any(np.isnan(weights2)):
+                raise ValueError(f"Weights are NaN for {Path(filepath).name}")
+
+            # Vectorized channel assignment using advanced indexing
+            # Filter for valid channels
+            valid_ch1_mask = (ch1_indices >= 0) & (ch1_indices < nz_output) & (weights1 > 0)
+            valid_ch2_mask = (ch2_indices >= 0) & (ch2_indices < nz_output) & (weights2 > 0) & two_channel_mask
+
+            # this is a corner case that can't happen .... but does?!?
+            # Get all unique channels that will receive contributions
+            all_contributing_channels = np.concatenate([
+                ch1_indices[valid_ch1_mask],
+                ch2_indices[valid_ch2_mask]
+            ])
+            contributing_channels_set = np.unique(all_contributing_channels)
+
+            # Initialize all required channels at once
+            for ch_idx in contributing_channels_set:
+                if np.all(np.isnan(output_datacube[ch_idx])):
+                    # in theory this should never happen because nothing is setting these to nan...
+                    print(f"    Warning: Channel {ch_idx} is all NaN, setting to zeros")
+                    output_datacube[ch_idx] = np.zeros((ny, nx), dtype=np.float32)
+                    channel_weights[ch_idx] = np.zeros((ny, nx), dtype=np.float32)
+
+            # Vectorized assignment for first channel contributions
+            if np.any(valid_ch1_mask):
+                valid_pixels_ch1 = np.where(valid_ch1_mask)[0]
+                ch1_valid = ch1_indices[valid_pixels_ch1]
+                weights1_valid = weights1[valid_pixels_ch1]
+                data_valid_ch1 = valid_data[valid_pixels_ch1]
+                y_coords_ch1 = valid_y_coords[valid_pixels_ch1]
+                x_coords_ch1 = valid_x_coords[valid_pixels_ch1]
+
+                # Use advanced indexing for batch assignment
+                output_datacube[ch1_valid, y_coords_ch1, x_coords_ch1] += data_valid_ch1 * weights1_valid
+                channel_weights[ch1_valid, y_coords_ch1, x_coords_ch1] += weights1_valid
+
+            # Vectorized assignment for second channel contributions
+            if np.any(valid_ch2_mask):
+                valid_pixels_ch2 = np.where(valid_ch2_mask)[0]
+                ch2_valid = ch2_indices[valid_pixels_ch2]
+                weights2_valid = weights2[valid_pixels_ch2]
+                data_valid_ch2 = valid_data[valid_pixels_ch2]
+                y_coords_ch2 = valid_y_coords[valid_pixels_ch2]
+                x_coords_ch2 = valid_x_coords[valid_pixels_ch2]
+
+                # Use advanced indexing for batch assignment
+                output_datacube[ch2_valid, y_coords_ch2, x_coords_ch2] += data_valid_ch2 * weights2_valid
+                channel_weights[ch2_valid, y_coords_ch2, x_coords_ch2] += weights2_valid
+
+            if self.verbose:
+                # Report wavelength range and channel contributions for this image
+                wl_min = np.nanmin(wavelength_map_2d)
+                wl_max = np.nanmax(wavelength_map_2d)
+                channels_list = sorted(contributing_channels_set)
+                channel_info = f"channels {channels_list[0]}-{channels_list[-1]}" if channels_list else "no channels"
+                print(f"    Image {i+1}/{len(image_files)}: {Path(filepath).name} "
+                        f"(λ: {wl_min:.3f}-{wl_max:.3f} μm) -> {channel_info} ({len(channels_list)} total)")
+
 
         # Compute weighted averages where multiple images contributed to the same channel/pixel
         if self.verbose:
@@ -1015,10 +1001,6 @@ class SPHEREXDownloader:
         target_coords : SkyCoord, optional
             Target coordinates for marking
         """
-        if not HAS_MATPLOTLIB:
-            if self.verbose:
-                print("Matplotlib not available. Skipping plots.")
-            return
 
         if self.verbose:
             print("Creating summary plots...")
@@ -1075,12 +1057,9 @@ class SPHEREXDownloader:
 
         # Mark target if provided
         if target_coords is not None:
-            try:
-                x_pix, y_pix = wcs.world_to_pixel(target_coords)
-                ax1.plot(x_pix, y_pix, 'r+', markersize=10, markeredgewidth=2)
-                ax1.text(x_pix+5, y_pix+5, 'Target', color='red', fontweight='bold')
-            except:
-                pass
+            x_pix, y_pix = wcs.world_to_pixel(target_coords)
+            ax1.plot(x_pix, y_pix, 'r+', markersize=10, markeredgewidth=2)
+            ax1.text(x_pix+5, y_pix+5, 'Target', color='red', fontweight='bold')
 
         # 2. Spectrum at center pixel
         ax2 = axes[0, 1]
@@ -1131,7 +1110,9 @@ class SPHEREXDownloader:
                       frame_size: u.Quantity = 5*u.arcmin,
                       max_images: int = None,
                       create_plots: bool = True,
-                      skip_download: bool = False
+                      skip_download: bool = False,
+                      use_local_only: bool = False,
+                      max_retries: int = 3
                       ) -> str:
         """
         Complete processing workflow for a target.
@@ -1150,6 +1131,12 @@ class SPHEREXDownloader:
             Maximum number of images to process
         create_plots : bool
             Whether to create summary plots
+        skip_download : bool
+            Skip downloading and use existing files
+        use_local_only : bool
+            Use only local files, skip all online queries
+        max_retries : int
+            Maximum number of retry attempts for failed queries
 
         Returns
         -------
@@ -1162,25 +1149,28 @@ class SPHEREXDownloader:
             print("="*60)
 
         # Step 1: Search for images
-        if not skip_download:
-            images = self.search_spherex_images(target, coordinates, radius)
+        if use_local_only or skip_download:
+            # Use existing local files
+            image_files = glob.glob(os.path.join(self.images_dir, "*.fits"))
+            if self.verbose:
+                print(f"Using {len(image_files)} existing local FITS files")
+            if max_images is not None:
+                image_files = image_files[:max_images]
+        else:
+            images = self.search_spherex_images(target, coordinates, radius, 
+                                               max_retries=max_retries,
+                                               use_local_only=use_local_only)
 
             if len(images) == 0:
                 print("No SPHEREX images found for the specified target/region")
                 return None
 
-        # Step 2: Download images
-        if not skip_download:
+            # Step 2: Download images
             image_files = self.download_images(images, max_images)
 
             if len(image_files) == 0:
                 print("No images were successfully downloaded")
                 return None
-
-        else:
-            image_files = glob.glob(os.path.join(self.output_dir, "images", "*.fits"))
-            if max_images is not None:
-                image_files = image_files[:max_images]
 
         assert len(image_files) > 0, "No images found"
 
@@ -1271,7 +1261,15 @@ def main():
     )
     parser.add_argument(
         '--skip-download', action='store_true',
-        help='Skip downloading images'
+        help='Skip downloading images (use existing files)'
+    )
+    parser.add_argument(
+        '--use-local-only', action='store_true',
+        help='Use only existing local files, skip all online queries (useful when IRSA is down)'
+    )
+    parser.add_argument(
+        '--retry-attempts', type=int, default=3,
+        help='Number of retry attempts for failed online queries'
     )
 
     args = parser.parse_args()
@@ -1295,7 +1293,9 @@ def main():
         frame_size=args.frame_size * u.arcmin,
         max_images=args.max_images,
         create_plots=not args.no_plots,
-        skip_download=args.skip_download
+        skip_download=args.skip_download,
+        use_local_only=args.use_local_only,
+        max_retries=args.retry_attempts
     )
 
     if datacube_path:
