@@ -16,6 +16,8 @@ Outputs:
 import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy import units as u
@@ -26,6 +28,7 @@ sys.path.insert(0, "/Users/adam/repos/icemodels")
 sys.path.insert(0, str(Path(__file__).parent))
 from icemodels.core import fluxes_in_filters  # noqa: E402
 from spherex_votable import load  # noqa: E402
+from spectrum_qc import qc  # noqa: E402
 
 OUT = Path(__file__).parent
 SPEC_DIR = OUT / "spectra"
@@ -72,9 +75,10 @@ def main() -> None:
         if row is None:
             continue
         spec = load(vot)[0]
-        good = spec.good_mask()
-        if good.sum() < 20:
+        qc_res = qc(spec)
+        if not qc_res.keep:
             continue
+        good = qc_res.keep_mask
         wl = spec.wavelength[good] * u.um
         fl = spec.flux[good] * u.uJy
         order = np.argsort(wl)

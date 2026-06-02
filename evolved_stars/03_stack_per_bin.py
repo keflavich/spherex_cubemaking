@@ -15,12 +15,15 @@ Writes:
 from pathlib import Path
 import sys
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.table import Table
 
 sys.path.insert(0, str(Path(__file__).parent))
 from spherex_votable import load  # noqa: E402
+from spectrum_qc import qc  # noqa: E402
 
 OUT_DIR = Path(__file__).parent
 SPEC_DIR = OUT_DIR / "spectra"
@@ -58,12 +61,13 @@ def bin_label(row) -> str:
     return f"RGB_feh{fi}_age{ai}_logg{li}"
 
 
-def regrid(spec) -> tuple[np.ndarray, np.ndarray]:
+def regrid(spec, good=None) -> tuple[np.ndarray, np.ndarray]:
     """Bin a per-source spectrum onto LAMBDA_GRID (mean of clean points/bin).
 
     Returns (flux_uJy, n_per_bin) on LAMBDA_GRID.
     """
-    good = spec.good_mask()
+    if good is None:
+        good = spec.good_mask()
     wl = spec.wavelength[good]
     fl = spec.flux[good]
     if len(wl) == 0:
@@ -90,16 +94,23 @@ def main() -> None:
     targets_by_id = {str(r["APOGEE_ID"]).strip(): r for r in targets}
     STACK_DIR.mkdir(exist_ok=True)
 
-    # Group VOTables by bin
+    # Group QC-passing VOTables by bin
     by_bin: dict[str, list[np.ndarray]] = {}
+    n_rejected = 0
     for vot in sorted(SPEC_DIR.glob("*.vot")):
         apid = vot.stem
         if apid not in targets_by_id:
             continue
-        label = bin_label(targets_by_id[apid])
         spec = load(vot)[0]
-        flux, _ = regrid(spec)
+        qc_res = qc(spec)
+        if not qc_res.keep:
+            n_rejected += 1
+            continue
+        label = bin_label(targets_by_id[apid])
+        flux, _ = regrid(spec, good=qc_res.keep_mask)
         by_bin.setdefault(label, []).append(flux)
+    if n_rejected:
+        print(f"QC rejected {n_rejected} spectra before stacking")
 
     if not by_bin:
         print("No matching spectra yet.")

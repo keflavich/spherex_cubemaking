@@ -164,7 +164,7 @@ def submit(target: Target,
 
 def status(handle: JobHandle, session: requests.Session) -> dict:
     """Poll the UWS endpoint."""
-    r = session.get(handle.job_url, timeout=30)
+    r = session.get(handle.job_url, timeout=15)
     r.raise_for_status()
     root = ET.fromstring(r.text)
     phase = root.findtext("uws:phase", default="UNKNOWN", namespaces=UWS_NS)

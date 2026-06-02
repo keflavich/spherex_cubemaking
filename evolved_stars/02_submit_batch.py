@@ -85,6 +85,12 @@ def main() -> None:
         if apid in ledger and not ledger[apid].get("done"):
             # Already submitted; will be polled in the loop.
             continue
+        # Don't re-try ABANDONED jobs — they hung indefinitely once and will
+        # almost certainly hang again. ERROR/ABORTED jobs are worth re-trying
+        # (often transient slurm issues).
+        if (apid in ledger and ledger[apid].get("done")
+                and ledger[apid].get("phase") == "ABANDONED"):
+            continue
         todo.append(Target(ra=float(row["RAJ2000"]),
                            dec=float(row["DEJ2000"]),
                            label=apid))
@@ -104,6 +110,7 @@ def main() -> None:
     todo_iter = iter(todo)
     next_target = next(todo_iter, None)
     last_done_at = 0.0  # epoch seconds; gate submissions after a completion
+    poll_errors: dict[str, int] = {}  # consecutive poll-error counter per job
 
     while in_flight or next_target is not None:
         # Fill up to MAX_CONCURRENT, but wait if we just had a completion
@@ -114,8 +121,12 @@ def main() -> None:
                 time.sleep(wait)
             try:
                 h = submit(next_target, sess)
-            except RuntimeError as e:
-                print(f"[skip] {next_target.label}: {e}")
+            except Exception as e:
+                # Catch broadly — RuntimeError (bare-response), ReadTimeout
+                # (IRSA hang), ConnectionError, anything else. Log as skip and
+                # move on, never crash the driver.
+                err_type = type(e).__name__
+                print(f"[skip] {next_target.label}: {err_type}: {e}")
                 next_target = next(todo_iter, None)
                 continue
             in_flight[next_target.label] = h
@@ -136,7 +147,18 @@ def main() -> None:
             try:
                 st = status(h, sess)
             except Exception as e:
-                print(f"[poll-error] {apid}: {e}")
+                # TOTAL (not consecutive) error count — counter is never reset.
+                # status() can intermittently succeed (returning QUEUED) which
+                # would mask a fundamentally-hung job if we used "consecutive".
+                poll_errors[apid] = poll_errors.get(apid, 0) + 1
+                print(f"[poll-error] {apid} (#{poll_errors[apid]}): {e}")
+                if poll_errors[apid] >= 6:
+                    print(f"[abandon] {apid}: {poll_errors[apid]} total poll "
+                          "errors, dropping from in-flight")
+                    ledger[apid].update(done=True, phase="ABANDONED",
+                                        error="poll endpoint unresponsive")
+                    save_ledger(ledger)
+                    del in_flight[apid]
                 continue
             if not is_terminal(st["phase"]):
                 continue
